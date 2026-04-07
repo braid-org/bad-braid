@@ -1,4 +1,4 @@
-# Simulate a bad network with bad.braid.org
+# Simulate a bad network<br>with Bad Braid
 
 To use it:
 - Just prepend your URL with `https://bad.braid.org/`
