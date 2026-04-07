@@ -1,4 +1,4 @@
-Simulate a bad network
+# Simulate a bad network
 
 Usage:
 
