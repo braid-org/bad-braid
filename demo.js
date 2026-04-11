@@ -11,11 +11,18 @@ var server = http.createServer(function (req, res) {
 
     // Braid-synced text at /
     if (req.method === 'PUT') {
+        var put_ver = req.version ? Number(req.version[0]) : 0
         var body = ''
         req.on('data', chunk => body += chunk)
         req.on('end', () => {
+            // Reject stale PUTs that arrived out of order
+            if (put_ver <= version) {
+                res.writeHead(432)
+                res.end()
+                return
+            }
             text = body
-            version++
+            version = put_ver
             for (var sub of subs)
                 sub.sendUpdate({version: ['' + version], body: text})
             res.writeHead(200)
@@ -126,20 +133,23 @@ var page_html = `<!DOCTYPE html>
         })
     }
 
-    // Send text on each keystroke
-    var send_timeout
+    // Send text on each keystroke — versioned so server ignores stale PUTs
+    var put_version = 0
+    var inflight = 0
+
     input.addEventListener('input', function () {
-        clearTimeout(send_timeout)
-        send_timeout = setTimeout(send, 0)
+        send()
     })
 
     async function send() {
         inflight++
+        put_version++
         send_lag.className = 'lag-indicator sending'
         var start = performance.now()
 
-        await braid_fetch(location.href, {
+        var res = await braid_fetch(location.href, {
             method: 'PUT',
+            version: ['' + put_version],
             headers: {'Content-Type': 'text/plain'},
             body: input.value
         })
@@ -147,11 +157,16 @@ var page_html = `<!DOCTYPE html>
         inflight--
         var rtt = Math.round(performance.now() - start)
         send_status.textContent = 'PUT round-trip: ' + rtt + ' ms'
-        if (inflight === 0)
+
+        // Server rejected as stale — resend with fresh version and current value
+        if (res.status === 432) return send()
+
+        if (inflight === 0) {
             send_lag.className = 'lag-indicator synced'
-        setTimeout(() => {
-            if (inflight === 0) send_lag.className = 'lag-indicator'
-        }, 300)
+            setTimeout(() => {
+                if (inflight === 0) send_lag.className = 'lag-indicator'
+            }, 300)
+        }
     }
 
     subscribe()

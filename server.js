@@ -7,7 +7,7 @@ var {Transform} = require('stream')
 var {http_server: braidify} = require('braid-http')
 
 var port = process.env.PORT || 4000
-var configs_file = 'configs.json'
+var configs_file = 'configs.db'
 
 // Load persisted configs or start fresh
 var configs = {}
@@ -20,10 +20,14 @@ function save_configs() {
     fs.writeFile(configs_file, JSON.stringify(configs, null, 2), () => {})
 }
 
+var default_config = {delay_ms: 0, loss_rate: 0, bandwidth_kbps: 0}
+
 function get_config(prefix) {
-    if (!configs[prefix])
-        configs[prefix] = {delay_ms: 0}
-    return configs[prefix]
+    if (!configs[prefix]) configs[prefix] = {}
+    var c = configs[prefix]
+    for (var k in default_config)
+        if (!(k in c)) c[k] = default_config[k]
+    return c
 }
 
 function get_version(prefix) {
@@ -42,20 +46,52 @@ function parse_path(url) {
     return {prefix, target: null}
 }
 
-// TCP delay: FIFO queue, each chunk stamped with a delivery time, drained in order.
-// Simulates a pipeline — chunks are in flight concurrently but arrive in order.
-function delay_stream(get_delay) {
+// Degrades a TCP stream.
+//
+// This creates a FIFO queue of chunks.  Each chunk is stamped with a delivery
+// time, and then drained in order with delays.  Creates Head-of-line
+// blocking.
+//
+// Config:
+//   delay_ms    — latency in each direction
+//   loss_rate   — probability per chunk of a loss event (adds ~1 RTT retransmit delay)
+//   bandwidth   — max kbps (0 = unlimited)
+//
+function degrade_stream(get_config) {
     var queue = []
     var timer = null
     var flush_cb = null
+    var bandwidth_available_at = 0  // earliest time the pipe is free for next byte
 
     var t = new Transform({
         transform(chunk, enc, cb) {
-            queue.push({chunk, deliver_at: Date.now() + get_delay()})
+            var config = get_config()
+            var now = Date.now()
+
+            // Latency: base one-way delay
+            var delay = config.delay_ms || 0
+
+            // Packet loss: retransmit penalty is ~1 RTT (2x one-way latency)
+            var loss_rate = config.loss_rate || 0
+            if (loss_rate > 0 && Math.random() < loss_rate)
+                delay += 2 * (config.delay_ms || 0)
+
+            // Bandwidth: time to transmit this chunk at max kbps
+            var bw = config.bandwidth_kbps || 0
+            if (bw > 0) {
+                var transmit_ms = (chunk.length * 8) / bw
+                bandwidth_available_at = Math.max(now, bandwidth_available_at) + transmit_ms
+                var bw_delay = bandwidth_available_at - now
+                delay = Math.max(delay, bw_delay)
+            }
+
+            queue.push({chunk, deliver_at: now + delay})
             if (!timer) schedule()
             cb()
         },
         flush(cb) {
+            // When the stream ends, wait for queued chunks to drain before
+            // finishing
             if (queue.length > 0) flush_cb = cb
             else cb()
         }
@@ -86,7 +122,7 @@ var hop_by_hop = new Set([
 function forward_headers(raw_headers, overrides) {
     var headers = {}
     for (var key in raw_headers)
-        if (!hop_by_hop.has(key.toLowerCase()))
+        if (!hop_by_hop.has(key.toLowerCase()) && !key.startsWith(':'))
             headers[key] = raw_headers[key]
     for (var key in overrides)
         headers[key] = overrides[key]
@@ -143,18 +179,23 @@ function config_html(prefix) {
         for (var key in config) {
             var label = document.createElement('label')
             var val = config[key]
-            label.innerHTML = key + ': <span class="val">' + Math.round(val) + '</span><br>'
+            var display = key === 'loss_rate' ? val.toFixed(2) : Math.round(val)
+            label.innerHTML = key + ': <span class="val">' + display + '</span><br>'
             var input = document.createElement('input')
             input.type = 'range'
             input.min = 0
-            input.max = key.match(/ms/) ? 5000 : 100
-            input.step = 'any'
+            input.max = key === 'delay_ms' ? 5000
+                      : key === 'bandwidth_kbps' ? 10000
+                      : key === 'loss_rate' ? 1
+                      : 100
+            input.step = key === 'loss_rate' ? 0.01 : 1
             input.value = val
             input.dataset.key = key
             input.oninput = function () {
-                var v = Math.round(Number(this.value))
-                config[this.dataset.key] = v
-                this.parentNode.querySelector('.val').textContent = v
+                var k = this.dataset.key
+                var v = k === 'loss_rate' ? Number(this.value) : Math.round(Number(this.value))
+                config[k] = v
+                this.parentNode.querySelector('.val').textContent = k === 'loss_rate' ? v.toFixed(2) : v
                 send()
             }
             label.appendChild(input)
@@ -240,8 +281,6 @@ function serve_config(req, res, prefix) {
 function proxy_http(req, res, prefix, target) {
     var url = new URL(target)
     var is_https = url.protocol === 'https:'
-    var config = get_config(prefix)
-    var get_delay = () => config.delay_ms || 0
 
     var mod = is_https ? https : http
     var upstream = mod.request({
@@ -261,7 +300,7 @@ function proxy_http(req, res, prefix, target) {
     upstream.on('response', upstream_res => {
         res.writeHead(upstream_res.statusCode, forward_headers(upstream_res.headers, {}))
         upstream_res
-            .pipe(delay_stream(get_delay))
+            .pipe(degrade_stream(() => get_config(prefix)))
             .pipe(res)
     })
 
@@ -269,7 +308,7 @@ function proxy_http(req, res, prefix, target) {
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
         upstream.end()
     } else {
-        req .pipe(delay_stream(get_delay))
+        req .pipe(degrade_stream(() => get_config(prefix)))
             .pipe(upstream)
     }
 }
@@ -279,8 +318,6 @@ function proxy_ws(req, client_socket, head, prefix, target) {
     // Parse target — support ws:// and wss:// as well as http:// and https://
     var url = new URL(target)
     var is_secure = url.protocol === 'wss:' || url.protocol === 'https:'
-    var config = get_config(prefix)
-    var get_delay = () => config.delay_ms || 0
 
     var target_port = url.port || (is_secure ? 443 : 80)
 
@@ -346,17 +383,30 @@ function proxy_ws(req, client_socket, head, prefix, target) {
 
             // Pipe bidirectionally with delay
             client_socket
-                .pipe(delay_stream(get_delay))
+                .pipe(degrade_stream(() => get_config(prefix)))
                 .pipe(upstream_socket)
             upstream_socket
-                .pipe(delay_stream(get_delay))
+                .pipe(degrade_stream(() => get_config(prefix)))
                 .pipe(client_socket)
         })
     })
 }
 
 // Main server
-var server = http.createServer(function (req, res) {
+var tls_options = null
+try {
+    tls_options = {
+        key: fs.readFileSync('key.pem'),
+        cert: fs.readFileSync('cert.pem'),
+        allowHTTP1: true
+    }
+} catch (e) {}
+
+var create_server = tls_options
+    ? (handler) => require('http2').createSecureServer(tls_options, handler)
+    : (handler) => http.createServer(handler)
+
+var server = create_server(function (req, res) {
     var {prefix, target} = parse_path(req.url)
 
     if (!target) {
@@ -381,4 +431,4 @@ server.on('upgrade', function (req, socket, head) {
     proxy_ws(req, socket, head, prefix, target)
 })
 
-server.listen(port, () => console.log('bad braid on port', port))
+server.listen(port, () => console.log('bad braid on port', port, tls_options ? '(https/h2)' : '(http)'))
