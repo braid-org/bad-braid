@@ -6,7 +6,7 @@ var fs = require('fs')
 var {Transform} = require('stream')
 var {http_server: braidify} = require('braid-http')
 
-var port = process.env.PORT || 4000
+var port = process.argv[2] || 4000
 var configs_file = 'configs.db'
 
 // Load persisted configs or start fresh
