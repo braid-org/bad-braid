@@ -56,6 +56,47 @@ var server = http.createServer(function (req, res) {
     if (!req.subscribe) res.end()
 })
 
+// Websocket echo server — for testing cookie-based ws proxying
+server.on('upgrade', function (req, socket, head) {
+    if (req.url !== '/ws-echo') {
+        socket.destroy()
+        return
+    }
+
+    // Minimal websocket handshake
+    var crypto = require('crypto')
+    var key = req.headers['sec-websocket-key']
+    var accept = crypto.createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-5ABB663B0174')
+        .digest('base64')
+
+    socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        'Sec-WebSocket-Accept: ' + accept + '\r\n' +
+        '\r\n'
+    )
+
+    // Echo back any frame we receive
+    socket.on('data', function (buf) {
+        // Parse client frame (masked)
+        if (buf.length < 6) return
+        var len = buf[1] & 0x7f
+        var mask = buf.slice(2, 6)
+        var payload = buf.slice(6, 6 + len)
+        for (var i = 0; i < payload.length; i++)
+            payload[i] ^= mask[i % 4]
+
+        // Send unmasked frame back
+        var frame = Buffer.alloc(2 + payload.length)
+        frame[0] = 0x81  // text, fin
+        frame[1] = payload.length
+        payload.copy(frame, 2)
+        socket.write(frame)
+    })
+})
+
 server.listen(3000, () => console.log('demo on http://localhost:3000'))
 
 var page_html = `<!DOCTYPE html>
@@ -109,6 +150,7 @@ var page_html = `<!DOCTYPE html>
   <div class="status" id="recv-status"></div>
 
   <p>/script.js (root-relative): <span id="script-status" style="color:#ff6666">not loaded</span></p>
+  <p>/ws-echo (websocket): <span id="ws-status" style="color:#ff6666">not connected</span></p>
   <script src="/script.js"></script>
 
   <div class="info">
@@ -180,6 +222,24 @@ var page_html = `<!DOCTYPE html>
     }
 
     subscribe()
+
+    // Test websocket via root-relative URL (uses cookie-based proxy hack)
+    var ws_status = document.getElementById('ws-status')
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    var ws = new WebSocket(proto + '//' + location.host + '/ws-echo')
+    ws.onopen = function () {
+        ws_status.textContent = 'connected'
+        ws_status.style.color = '#66ff88'
+        ws.send('ping')
+    }
+    ws.onmessage = function (e) {
+        ws_status.textContent = 'echo: ' + e.data
+        ws_status.style.color = '#66ff88'
+    }
+    ws.onerror = function () {
+        ws_status.textContent = 'error'
+        ws_status.style.color = '#ff6666'
+    }
   </script>
 </body>
 </html>`

@@ -5,6 +5,9 @@ var tls = require('tls')
 var fs = require('fs')
 var {Transform} = require('stream')
 var {http_server: braidify} = require('braid-http')
+var {WebSocketServer} = require('ws')
+
+var wss = new WebSocketServer({noServer: true})
 
 var port = process.argv[2] || 4000
 var configs_file = 'configs.db'
@@ -298,7 +301,18 @@ function proxy_http(req, res, prefix, target) {
     })
 
     upstream.on('response', upstream_res => {
-        res.writeHead(upstream_res.statusCode, forward_headers(upstream_res.headers, {}))
+        var headers = forward_headers(upstream_res.headers, {})
+
+        // Remember target origin in a cookie so websocket upgrades can find it
+        var origin = new URL(target).origin
+        var cookie = 'bad_braid=' + encodeURIComponent((prefix ? prefix + '/' : '') + origin) + '; Path=/; SameSite=Lax'
+        var existing = headers['set-cookie']
+        if (existing)
+            headers['set-cookie'] = [].concat(existing, cookie)
+        else
+            headers['set-cookie'] = cookie
+
+        res.writeHead(upstream_res.statusCode, headers)
         upstream_res
             .pipe(degrade_stream(() => get_config(prefix)))
             .pipe(res)
@@ -313,82 +327,57 @@ function proxy_http(req, res, prefix, target) {
     }
 }
 
-// WebSocket proxy with bidirectional delay
+// WebSocket proxy with bidirectional delay.
+// Uses the ws library for the client-side handshake (browsers require it),
+// then detaches the raw socket and pipes it to the upstream through degrade_stream.
 function proxy_ws(req, client_socket, head, prefix, target) {
-    // Parse target — support ws:// and wss:// as well as http:// and https://
     var url = new URL(target)
     var is_secure = url.protocol === 'wss:' || url.protocol === 'https:'
+    var mod = is_secure ? https : http
 
-    var target_port = url.port || (is_secure ? 443 : 80)
+    // Complete the websocket handshake with the client
+    wss.handleUpgrade(req, client_socket, head, function (ws) {
+        var raw = ws._socket
 
-    // Connect to upstream
-    var upstream_socket
-    var connect_event
-    if (is_secure) {
-        upstream_socket = tls.connect({host: url.hostname, port: target_port, servername: url.hostname})
-        connect_event = 'secureConnect'
-    } else {
-        upstream_socket = net.connect({host: url.hostname, port: target_port})
-        connect_event = 'connect'
-    }
+        // Detach ws from the socket so we can pipe raw bytes
+        raw.removeAllListeners('data')
+        raw.removeAllListeners('close')
+        raw.removeAllListeners('end')
 
-    upstream_socket.on('error', e => {
-        console.log('ws upstream error:', e.code || e.message)
-        client_socket.destroy()
-    })
-    client_socket.on('error', e => {
-        console.log('ws client error:', e.code || e.message)
-        upstream_socket.destroy()
-    })
+        // Connect to the upstream server
+        var headers = forward_headers(req.headers, {host: url.host})
+        headers.connection = 'Upgrade'
+        headers.upgrade = 'websocket'
 
-    // Build the upgrade request — forward original ws headers
-    var path = (url.pathname || '/') + (url.search || '')
-    var headers = forward_headers(req.headers, {host: url.host})
-    // Restore hop-by-hop headers needed for ws upgrade
-    headers.connection = 'Upgrade'
-    headers.upgrade = 'websocket'
+        var upstream_req = mod.request({
+            hostname: url.hostname,
+            port: url.port || (is_secure ? 443 : 80),
+            path: (url.pathname || '/') + (url.search || ''),
+            headers: headers
+        })
 
-    var raw_request = 'GET ' + path + ' HTTP/1.1\r\n'
-    for (var key in headers)
-        raw_request += key + ': ' + headers[key] + '\r\n'
-    raw_request += '\r\n'
+        upstream_req.on('error', e => {
+            console.log('ws upstream error:', e.code || e.message)
+            raw.destroy()
+        })
+        raw.on('error', e => {
+            console.log('ws client error:', e.code || e.message)
+            upstream_req.destroy()
+        })
 
-    upstream_socket.on(connect_event, () => {
-        upstream_socket.write(raw_request)
-        if (head && head.length) upstream_socket.write(head)
+        upstream_req.on('upgrade', (upstream_res, upstream_socket, upstream_head) => {
+            if (upstream_head && upstream_head.length)
+                upstream_socket.unshift(upstream_head)
 
-        // Wait for the 101 response from upstream
-        var response_buf = Buffer.alloc(0)
-        var headers_done = false
-
-        upstream_socket.on('data', function on_upgrade_data(chunk) {
-            if (headers_done) return
-
-            response_buf = Buffer.concat([response_buf, chunk])
-            var header_end = response_buf.indexOf('\r\n\r\n')
-            if (header_end === -1) return
-
-            headers_done = true
-            upstream_socket.removeListener('data', on_upgrade_data)
-
-            // Forward the 101 response to client
-            var header_part = response_buf.slice(0, header_end + 4)
-            var remainder = response_buf.slice(header_end + 4)
-
-            client_socket.write(header_part)
-
-            // If there's data after the headers, push it through
-            if (remainder.length)
-                upstream_socket.unshift(remainder)
-
-            // Pipe bidirectionally with delay
-            client_socket
-                .pipe(degrade_stream(() => get_config(prefix)))
+            // Pipe bidirectionally with degradation
+            raw .pipe(degrade_stream(() => get_config(prefix)))
                 .pipe(upstream_socket)
             upstream_socket
                 .pipe(degrade_stream(() => get_config(prefix)))
-                .pipe(client_socket)
+                .pipe(raw)
         })
+
+        upstream_req.end()
     })
 }
 
@@ -446,10 +435,6 @@ var server = create_server(function (req, res) {
         return
     }
 
-    // Remember the target origin so websocket upgrades can find it via cookie
-    var origin = new URL(target).origin
-    res.setHeader('Set-Cookie', 'bad_braid=' + encodeURIComponent((prefix ? prefix + '/' : '') + origin) + '; Path=/; SameSite=Lax')
-
     proxy_http(req, res, prefix, target)
 })
 
@@ -474,6 +459,7 @@ server.on('upgrade', function (req, socket, head) {
     }
 
     if (!target) {
+        console.log('ws: no target found, destroying')
         socket.destroy()
         return
     }

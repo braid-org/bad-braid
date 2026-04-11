@@ -4,6 +4,7 @@
   "description": "Simulate a bad network with Bad Braid",
   "main": "server.js",
   "dependencies": {
-    "braid-http": "^1.3.111"
+    "braid-http": "^1.3.111",
+    "ws": "^8.20.0"
   }
 }
