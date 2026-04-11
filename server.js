@@ -446,11 +446,33 @@ var server = create_server(function (req, res) {
         return
     }
 
+    // Remember the target origin so websocket upgrades can find it via cookie
+    var origin = new URL(target).origin
+    res.setHeader('Set-Cookie', 'bad_braid=' + encodeURIComponent((prefix ? prefix + '/' : '') + origin) + '; Path=/; SameSite=Lax')
+
     proxy_http(req, res, prefix, target)
 })
 
 server.on('upgrade', function (req, socket, head) {
     var {prefix, target} = parse_path(req.url)
+
+    // Recover target from cookie if not in the URL (e.g. new WebSocket('/ws'))
+    if (!target) {
+        var cookies = {}
+        ;(req.headers.cookie || '').split(';').forEach(function (c) {
+            var parts = c.trim().split('=')
+            if (parts.length === 2) cookies[parts[0]] = decodeURIComponent(parts[1])
+        })
+        if (cookies.bad_braid) {
+            var cookie_parsed = parse_path('/' + cookies.bad_braid)
+            if (cookie_parsed.target) {
+                var origin = new URL(cookie_parsed.target).origin
+                target = origin + req.url
+                prefix = cookie_parsed.prefix
+            }
+        }
+    }
+
     if (!target) {
         socket.destroy()
         return
