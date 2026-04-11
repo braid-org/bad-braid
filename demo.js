@@ -9,6 +9,13 @@ var server = http.createServer(function (req, res) {
     braidify(req, res)
     if (req.is_multiplexer) return
 
+    // Test script — loaded via root-relative URL to test referer-based proxying
+    if (req.url === '/script.js') {
+        res.writeHead(200, {'Content-Type': 'application/javascript'})
+        res.end('document.getElementById("script-status").textContent = "loaded!"')
+        return
+    }
+
     // Braid-synced text at /
     if (req.method === 'PUT') {
         var put_ver = req.version ? Number(req.version[0]) : 0
@@ -100,6 +107,9 @@ var page_html = `<!DOCTYPE html>
   <h2>Server sees this <span class="lag-indicator" id="recv-lag"></span></h2>
   <div class="server-view" id="server-view"></div>
   <div class="status" id="recv-status"></div>
+
+  <p>/script.js (root-relative): <span id="script-status" style="color:#ff6666">not loaded</span></p>
+  <script src="/script.js"></script>
 
   <div class="info">
     <p>Access this page through Bad Braid to add latency:</p>

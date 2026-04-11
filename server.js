@@ -409,6 +409,33 @@ var create_server = tls_options
 var server = create_server(function (req, res) {
     var {prefix, target} = parse_path(req.url)
 
+    // Split the path into the prefix, and the remote "target" URL we are proxying.
+
+    // If there's no target in the URL, then there are two possibilities:
+    //
+    //  1. This is the configuration page for the prefix alone
+    //  2. The actual page already loaded, and now is asking for its assets like /script.js
+    //     to load.
+    //
+    // We have a crazy hack for case 2 -- we look for the referer header.  And
+    // if that's present, we rewrite the URL for it. :)
+
+    // Let's check case two first:
+    if (!target) {
+        // Try to recover target from referer header (handles /style.css loaded
+        // from a page at /prefix/https://example.com/)
+        var ref = req.headers.referer || req.headers.referrer
+        if (ref) {
+            var ref_parsed = parse_path(new URL(ref).pathname)
+            if (ref_parsed.target) {
+                var origin = new URL(ref_parsed.target).origin
+                target = origin + req.url
+                prefix = ref_parsed.prefix
+            }
+        }
+    }
+
+    // Otherwise, this is a configurator page.
     if (!target) {
         var accepts = req.headers.accept || ''
         if (accepts.includes('application/json') || accepts.includes('text/json'))
