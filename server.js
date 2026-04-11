@@ -369,6 +369,11 @@ function proxy_ws(req, client_socket, head, prefix, target) {
             if (upstream_head && upstream_head.length)
                 upstream_socket.unshift(upstream_head)
 
+            upstream_socket.on('error', e => {
+                console.log('ws upstream socket error:', e.code || e.message)
+                raw.destroy()
+            })
+
             // Pipe bidirectionally with degradation
             raw .pipe(degrade_stream(() => get_config(prefix)))
                 .pipe(upstream_socket)
