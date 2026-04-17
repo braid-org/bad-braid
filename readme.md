@@ -1,3 +1,5 @@
+<img src='https://braid.org/files/bad-braid.svg'>
+
 # Simulate a bad network<br>with Bad Braid
 
 To use it:
@@ -7,3 +9,4 @@ To use it:
 You can use this to test how your website, its assets, and its websockets perform under bad network conditions by prepending `https://bad.braid.org/` to each of them.
 
 This repository contains the source code for the bad.braid.org proxy.
+
